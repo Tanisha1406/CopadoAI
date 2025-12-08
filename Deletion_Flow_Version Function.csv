@@ -1,0 +1,147 @@
+"_","copado__API_Name__c","copado__Type__c","copado__Image_Name__c","copado__Script__c","copado__Description__c","Name","copado__Timeout__c","copado__Parameters__c"
+"[copado__Function__c]","Deletion_Flow_Version","Custom","copado-function-core:v1","#!/usr/bin/env bash
+set -eo pipefail
+API_VERSION=""60.0""  # Salesforce API version
+
+###############################################
+# 1. Validate FLOW_LIST
+###############################################
+if [[ -z ""$FLOW_LIST"" ]]; then
+  echo ""ERROR: FLOW_LIST variable is not set.""
+  echo ""Expected format: FlowA,FlowB,FlowC""
+  exit 1
+fi
+
+###############################################
+# 2. Validate Salesforce environment variables
+###############################################
+if [[ -z ""$Endpoint"" || ""$Endpoint"" == ""null"" ]]; then
+  echo ""ERROR: Salesforce Endpoint not set.""
+  exit 1
+fi
+
+if [[ -z ""$SessionID"" ]]; then
+  echo ""ERROR: SessionID (Auth token) not set.""
+  exit 1
+fi
+
+###############################################
+# 3. Compute base URL
+###############################################
+tmp=""${Endpoint#*://}""
+tmp=""${tmp#*@}""
+baseDomain=""${tmp%%[:/]*}""
+baseUrl=""https://$baseDomain""
+
+echo ""DEBUG: Using baseUrl=$baseUrl""
+
+###############################################
+# 4. Parse FLOW_LIST into SOQL filter
+###############################################
+IFS=',' read -ra FLOWS <<< ""$FLOW_LIST""
+
+SOQL_FILTER=""""
+for FLOW in ""${FLOWS[@]}""; do
+  FLOW=$(echo ""$FLOW"" | xargs)
+  [[ -z ""$FLOW"" ]] && continue
+  
+  if [[ -n ""$SOQL_FILTER"" ]]; then
+    SOQL_FILTER+="" OR""
+  fi
+
+  # CORRECT FIELD NAME
+  SOQL_FILTER+="" Definition.DeveloperName = '$FLOW'""
+done
+
+if [[ -z ""$SOQL_FILTER"" ]]; then
+  echo ""ERROR: No valid flow names found after parsing FLOW_LIST.""
+  exit 1
+fi
+
+###############################################
+# 5. Build proper SOQL Query
+###############################################
+QUERY=""
+SELECT Id, VersionNumber, Status, MasterLabel, Definition.DeveloperName
+FROM Flow
+WHERE Status != 'Active'
+AND ($SOQL_FILTER)
+""
+
+ENCODED_QUERY=$(echo ""$QUERY"" | jq -sRr @uri)
+
+echo ""INFO: Querying inactive flow versions...""
+RESPONSE_FILE=$(mktemp)
+
+###############################################
+# 6. Execute Tooling API Query
+###############################################
+HTTP_STATUS=$(curl -s -o ""$RESPONSE_FILE"" -w ""%{http_code}"" -X GET \
+  ""$baseUrl/services/data/v${API_VERSION}/tooling/query/?q=$ENCODED_QUERY"" \
+  -H ""Authorization: Bearer $SessionID"" \
+  -H ""Content-Type: application/json"")
+
+if [[ ""$HTTP_STATUS"" -ne 200 ]]; then
+  echo ""ERROR: Query failed (HTTP $HTTP_STATUS)""
+  cat ""$RESPONSE_FILE""
+  exit 1
+fi
+
+RESPONSE=$(cat ""$RESPONSE_FILE"")
+IDS=$(echo ""$RESPONSE"" | jq -r '.records[].Id')
+
+###############################################
+# 7. Handle no results
+###############################################
+if [[ -z ""$IDS"" ]]; then
+  echo ""No inactive versions found for provided flows.""
+  rm -f ""$RESPONSE_FILE""
+  exit 0
+fi
+
+echo ""Found inactive Flow versions:""
+echo ""$RESPONSE"" | jq -r '.records[] | ""\(.Definition.DeveloperName) v\(.VersionNumber) – Status=\(.Status) – ID: \(.Id)""'
+
+echo """"
+echo ""Starting deletion...""
+
+###############################################
+# 8. Delete all inactive Flow versions
+###############################################
+SUCCESS=0
+TOTAL=0
+
+while IFS= read -r FLOW_ID; do
+  FLOW_ID=$(echo ""$FLOW_ID"" | xargs)
+  [[ -z ""$FLOW_ID"" ]] && continue
+
+  TOTAL=$((TOTAL + 1))
+
+  DELETE_STATUS=$(curl -s -o /dev/null -w ""%{http_code}"" -X DELETE \
+        ""$baseUrl/services/data/v${API_VERSION}/tooling/sobjects/Flow/$FLOW_ID"" \
+        -H ""Authorization: Bearer $SessionID"")
+
+  if [[ ""$DELETE_STATUS"" -eq 204 ]]; then
+    echo ""Deleted Flow ID: $FLOW_ID""
+    SUCCESS=$((SUCCESS + 1))
+  else
+    echo ""Failed to delete Flow ID: $FLOW_ID (HTTP $DELETE_STATUS)""
+  fi
+
+done <<< ""$IDS""
+
+rm -f ""$RESPONSE_FILE""
+
+###############################################
+# 9. Summary
+###############################################
+echo """"
+echo ""-----------------------------------------""
+echo ""Deleted $SUCCESS out of $TOTAL inactive flow versions.""
+echo ""All done!""","This function is used to delete the inactive versions of flow","Deletion of Flow","","[ {
+  ""name"" : ""SessionID"",
+  ""defaultValue"" : ""{$Context.Credential.SessionId}""
+}, {
+  ""name"" : ""Endpoint"",
+  ""defaultValue"" : ""{$Context.Credential.Endpoint}""
+} ]"

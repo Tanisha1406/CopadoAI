@@ -1,0 +1,200 @@
+"_","copado__API_Name__c","copado__Type__c","copado__Image_Name__c","copado__Script__c","copado__Description__c","Name","copado__Timeout__c","copado__Parameters__c"
+"[copado__Function__c]","Scheduling_Apex","Custom","copado-function-core:v1","#!/usr/bin/env node
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Script: scheduleApexClass.js
+// Purpose: Schedule an Apex class in Salesforce using Copado-provided SessionID
+// Author: Updated by ChatGPT
+// Notes:
+//   - Uses Salesforce Tooling API
+//   - Deletes existing jobs with same name
+//   - Creates new schedule based on CRON
+//   - Copado injects: CF_SF_SESSIONID, CF_SF_ENDPOINT
+//   - Copado inputs: APEX_CLASS, JOB_NAME, CRON_EXP
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+const execSync = require(""child_process"").execSync;
+
+// -----------------------------------------------------------------------------
+// Read Copado Environment Variables
+// -----------------------------------------------------------------------------
+const sfHost = process.env.CF_SF_ENDPOINT;
+const sfSessionId = process.env.CF_SF_SESSIONID;
+
+// -----------------------------------------------------------------------------
+// Read Copado Input Parameters
+// -----------------------------------------------------------------------------
+const APEX_CLASS = process.env.APEX_CLASS || """";
+const JOB_NAME = process.env.JOB_NAME || """";
+const CRON_EXP = process.env.CRON_EXP || """";
+
+// -----------------------------------------------------------------------------
+// Start Logging
+// -----------------------------------------------------------------------------
+log2CopadoStatus(""<<< FUNCTION: START >>>"");
+log2CopadoStatus(""INFO: Scheduling Apex Class..."");
+
+// Validate inputs
+if (!sfHost || !sfSessionId || !APEX_CLASS || !CRON_EXP || !JOB_NAME) {
+  console.log(""ERROR: Missing required parameters."");
+  process.exit(1);
+}
+
+console.log(""PARAMETERS:"");
+console.log("" - SF HOST:"", sfHost);
+console.log("" - SF SESSION ID: Provided"");
+console.log("" - APEX_CLASS:"", APEX_CLASS);
+console.log("" - JOB_NAME:"", JOB_NAME);
+console.log("" - CRON_EXP:"", CRON_EXP);
+
+// Salesforce Tooling API base
+const toolingBase = `${sfHost}/services/data/v64.0/tooling`;
+
+// -----------------------------------------------------------------------------
+// 1. DELETE EXISTING JOBS
+// -----------------------------------------------------------------------------
+log2CopadoStatus(""STEP 1: Checking existing jobs..."");
+
+try {
+  const soql = `SELECT Id, CronJobDetail.Name FROM CronTrigger WHERE CronJobDetail.Name = '${JOB_NAME}'`;
+  const queryUrl = `${toolingBase}/query/?q=${encodeURIComponent(soql)}`;
+
+  const response = sfGet(queryUrl);
+  const records = response.records || [];
+
+  if (records.length > 0) {
+    console.log(`Found ${records.length} existing jobs. Deleting...`);
+    records.forEach((r) => {
+      const deleteUrl = `${toolingBase}/sobjects/CronTrigger/${r.Id}`;
+      sfDelete(deleteUrl);
+      console.log(`Deleted CronTrigger: ${r.Id}`);
+    });
+  } else {
+    console.log(""No existing jobs found."");
+  }
+} catch (err) {
+  console.log(""ERROR deleting existing jobs:"", err);
+}
+
+// -----------------------------------------------------------------------------
+// 2. Fetch ApexClass Id (for CronJobDetail)
+// -----------------------------------------------------------------------------
+log2CopadoStatus(""STEP 2: Fetching ApexClass Id..."");
+
+let apexClassId = """";
+
+try {
+  const soql = `SELECT Id FROM ApexClass WHERE Name='${APEX_CLASS}' LIMIT 1`;
+  const queryUrl = `${toolingBase}/query/?q=${encodeURIComponent(soql)}`;
+  const result = sfGet(queryUrl);
+
+  if (!result.records || result.records.length === 0) {
+    console.log(""ERROR: ApexClass not found:"", APEX_CLASS);
+    process.exit(1);
+  }
+
+  apexClassId = result.records[0].Id;
+  console.log(""ApexClassId ="", apexClassId);
+} catch (err) {
+  console.log(""ERROR fetching ApexClassId:"", err);
+  process.exit(1);
+}
+
+// -----------------------------------------------------------------------------
+// 3. Create CronTrigger (Schedule Job)
+// -----------------------------------------------------------------------------
+log2CopadoStatus(""STEP 3: Creating CronTrigger..."");
+
+let scheduleId = """";
+try {
+  const startTime = new Date(); // Required for CronTrigger
+  const payload = {
+    CronJobDetailId: apexClassId,  // Correct field for scheduling
+    CronExpression: CRON_EXP,
+    TimesTriggered: 0,
+    State: ""WAITING"",
+    StartTime: startTime.toISOString(),
+  };
+
+  const url = `${toolingBase}/sobjects/CronTrigger`;
+  const result = sfPost(url, payload);
+
+  if (result.id) {
+    scheduleId = result.id;
+    console.log(""SUCCESS: Job Scheduled. CronTrigger Id:"", scheduleId);
+  } else if (Array.isArray(result) && result[0] && result[0].errorCode) {
+    console.log(""ERROR: Failed to schedule job:"", JSON.stringify(result));
+    process.exit(1);
+  } else {
+    console.log(""ERROR: Unknown response:"", JSON.stringify(result));
+    process.exit(1);
+  }
+} catch (err) {
+  console.log(""ERROR scheduling job:"", err);
+  process.exit(1);
+}
+
+// -----------------------------------------------------------------------------
+// OUTPUT JSON (Copado-compatible)
+// -----------------------------------------------------------------------------
+console.log(""COPADO_OUTPUT:"");
+console.log(
+  JSON.stringify(
+    [
+      {
+        actionName: ""scheduleApexClass"",
+        isSuccess: true,
+        jobName: JOB_NAME,
+        apexClass: APEX_CLASS,
+        cronExpression: CRON_EXP,
+        scheduleId: scheduleId,
+      },
+    ],
+    null,
+    2
+  )
+);
+
+log2CopadoStatus(""<<< FUNCTION: END >>>"");
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+function log2CopadoStatus(msg) {
+  try {
+    execSync(`copado -p '${msg}'`);
+  } catch (e) {
+    console.log(msg);
+  }
+}
+
+function sfGet(url) {
+  const cmd = `curl -s -H ""Authorization: Bearer ${sfSessionId}"" -H ""Content-Type: application/json"" ""${url}""`;
+  return JSON.parse(execSync(cmd, { encoding: ""utf8"" }));
+}
+
+function sfDelete(url) {
+  const cmd = `curl -s -X DELETE -H ""Authorization: Bearer ${sfSessionId}"" ""${url}""`;
+  return execSync(cmd, { encoding: ""utf8"" });
+}
+
+function sfPost(url, payload) {
+  const json = JSON.stringify(payload);
+  const cmd = `curl -s -X POST -H ""Authorization: Bearer ${sfSessionId}"" -H ""Content-Type: application/json"" -d '${json}' ""${url}""`;
+  return JSON.parse(execSync(cmd, { encoding: ""utf8"" }));
+}","","Scheduling Apex","","[ {
+  ""name"" : ""SessionID"",
+  ""defaultValue"" : ""{$Destination.Credential.SessionId}""
+}, {
+  ""name"" : ""Endpoint"",
+  ""defaultValue"" : ""{$Destination.Credential.Endpoint}""
+}, {
+  ""name"" : ""APEX_CLASS"",
+  ""defaultValue"" : """"
+}, {
+  ""name"" : ""JOB_NAME"",
+  ""defaultValue"" : """"
+}, {
+  ""name"" : ""CRON_EXP"",
+  ""defaultValue"" : """"
+} ]"

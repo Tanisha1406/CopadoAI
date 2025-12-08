@@ -1,0 +1,342 @@
+"_","copado__API_Name__c","copado__Type__c","copado__Image_Name__c","copado__Script__c","copado__Description__c","Name","copado__Timeout__c","copado__Parameters__c"
+"[copado__Function__c]","Execute_ApexTest","Custom","copado-multicloud-metadata","#!/usr/bin/env node
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+//
+// Notes: 1. This script parses details from a copado__Apex_Test_Result__c attachment for the specified org
+//        2. Pre-Req: Set a frequency on the Credential so that tests are executed and results are stored
+//        3. Email is delivered through SF Rest API and sends from the current SF user executing this process
+//           a. emailTo is a comma-delimitted list
+//        4. const init: apiVersion is currently set to v64.0
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+
+const execSync = require('child_process').execSync;
+
+// function parameters
+const sfHost = process.env.CF_SF_ENDPOINT;
+const sfSessionId = process.env.CF_SF_SESSIONID;
+const credentialName = (process.env.credentialName.length > 0) ? process.env.credentialName : '';
+const minCodeCoverage = (parseInt(process.env.minCodeCoverage) > 75) ? parseInt(process.env.minCodeCoverage) : 75;
+const emailTo = (process.env.sendEmailTo.length > 0) ? process.env.sendEmailTo : '';
+
+log2CopadoStatus('<<< FUNCTION: START >>>');
+
+// sf cli init
+log2CopadoStatus('SF CLI: init...');
+if(!initSFCLI(sfSessionId, sfHost)) {
+    console.log('SF CLI: not ready - exiting...');
+    process.exit(1);
+}
+
+// const init
+const apiVersion = 'v64.0';
+const credentialId = getIdForName(credentialName, sfSessionId);
+const isoDateString = new Date().toISOString();
+const apexTestExecReport = `/app/apexTestExecReport_${isoDateString.replace(/\:|\.|-/g, '')}.txt`;
+const emailSubject = `COPADO: Apex Test Execution Report | ${isoDateString}`;
+
+// var init
+var aQuery = `SELECT Id
+    FROM copado__Apex_Test_Result__c
+    WHERE copado__Org__c = '${credentialId}'
+    AND CreatedDate = TODAY
+    LIMIT 1`;
+var apexTestExecId = '', jsonData = '', email = '', emailBody = '', report = '', reportBody = '';
+var totalRecords = 0, classCovCtr = 0, triggerCovCtr = 0, methodCtr = 0;
+var errFlag = false;
+
+// QUERY
+log2CopadoStatus('QUERY: Apex Test Execution record');
+try {
+    jsonData = sfCLIQuery(aQuery, sfSessionId);
+
+    if('result' in jsonData && 'totalSize' in jsonData.result) {
+        totalRecords = jsonData.result.totalSize;
+    }
+
+    if(!isNaN(totalRecords) && totalRecords == 1) {
+        Object.entries(jsonData.result.records).forEach((entry) => {
+            const [key, value] = entry;
+            apexTestExecId = value.Id;
+        });
+    }
+}
+catch(err) {
+    errFlag = true;
+    console.log(err);
+}
+
+// ATTACHMENT PARSE
+log2CopadoStatus('ATTACHMENT: Parse apex test execution details');
+try {
+    jsonData = JSON.parse(getAttachmentByNameForParentId(apexTestExecId, 'ApexTestResult', sfSessionId, sfHost, 'json'));
+
+    reportBody += `Execution Time (mins): ${Math.round((jsonData.time / 60000)*100)/100}\n`;
+    emailBody += `Execution Time (mins): ${Math.round((jsonData.time / 60000)*100)/100}\\n`;
+
+    reportBody += `Org Coverage: ${Math.round(jsonData.userStoryCoverage*100)/100}%\n`;
+    emailBody += `Org Coverage: ${Math.round(jsonData.userStoryCoverage*100)/100}%\\n`;
+
+    reportBody += `Total Tests: ${jsonData.tests}\n`;
+    emailBody += `Total Tests: ${jsonData.tests}\\n`;
+
+    reportBody += `Errors: ${jsonData.errors}\n`;
+    emailBody += `Errors: ${jsonData.errors}\\n`;
+
+    reportBody += `Failures: ${jsonData.failures}\n`;
+    emailBody += `Failures: ${jsonData.failures}\\n`;
+
+    reportBody += `Failing Methods: ${jsonData.failingMethods}\n`;
+    emailBody += `Failing Methods: ${jsonData.failingMethods}\\n`;
+
+    reportBody += `Classes w/o Coverage: ${jsonData.classesWithoutCoverage}\n`;
+    emailBody += `Classes w/o Coverage: ${jsonData.classesWithoutCoverage}\\n`;
+
+    reportBody += `Triggers w/o Coverage: ${jsonData.triggersWithoutCoverage}\n`;
+    emailBody += `Triggers w/o Coverage: ${jsonData.triggersWithoutCoverage}\\n`;
+
+    // class coverage
+    reportBody += `Class Coverage Results (less than ${minCodeCoverage}%):\n`;
+    emailBody += `Class Coverage Results (less than ${minCodeCoverage}%):\\n`;
+    Object.entries(jsonData.classCoverageResults).forEach(([key, value]) => {
+        if(value.coverage < minCodeCoverage) {
+            classCovCtr++;
+            reportBody += `   - ${key} -- ${value.coverage}%\n`;
+            emailBody += `   - ${key} -- ${value.coverage}%\\n`;
+        }
+    });
+    if(classCovCtr == 0) {
+        reportBody += `   - none\n`;
+        emailBody += `   - none\\n`;
+    }
+
+    // trigger coverage
+    reportBody += `Trigger Coverage Results (less than ${minCodeCoverage}%):\n`;
+    emailBody += `Trigger Coverage Results (less than ${minCodeCoverage}%):\\n`;
+    Object.entries(jsonData.triggerCoverageResults).forEach(([key, value]) => {
+        if(value.coverage < minCodeCoverage) {
+            triggerCovCtr++;
+            reportBody += `   - ${key} -- ${value.coverage}%\n`;
+            emailBody += `   - ${key} -- ${value.coverage}%\\n`;
+        }
+    });
+    if(triggerCovCtr == 0) {
+        reportBody += `   - none\n`;
+        emailBody += `   - none\\n`;
+    }
+
+    // method failures
+    reportBody += `Test Class Methods Results (failed methods):\n`;
+    emailBody += `Test Class Methods Results (failed methods):\\n`;
+    Object.entries(jsonData.testClassResults).forEach(([key, value]) => {
+        if(!value.methods[0].success) {
+            methodCtr++;
+            reportBody += `   - ${key} -- method: ${value.methods[0].name} | message: ${value.methods[0].message}\n`;
+            emailBody += `   - ${key} -- method: ${value.methods[0].name} | message: ${value.methods[0].message}\\n`;
+        }
+    });
+    if(methodCtr == 0) {
+        reportBody += `   - none\n`;
+        emailBody += `   - none\\n`;
+    }
+}
+catch(err) {
+    errFlag = true;
+    console.log(err);
+}
+
+// REPORT FORMATTING
+log2CopadoStatus('REPORT: Formatting...');
+report = '~'.repeat(80) + `\nCOPADO: APEX TEST EXECUTION REPORT (${isoDateString})\n` + '~'.repeat(80) + '\n\n';
+email = '~'.repeat(80) + `\\nCOPADO: APEX TEST EXECUTION REPORT (${isoDateString})\\n` + '~'.repeat(80) + '\\n\\n';
+
+if(!errFlag) {
+    report += `Credential: ${credentialName} (${credentialId})\n`;
+    email += `Credential: ${credentialName} (${credentialId})\\n`;
+
+    report += `Apex Test Execution Id: ${apexTestExecId}\n`;
+    email += `Apex Test Execution Id: ${apexTestExecId}\\n`;
+
+    report += reportBody;
+    email += emailBody;
+}
+else {
+    report += '~'.repeat(80) + '\nREPORT GENERATION FAILURE\n' + '~'.repeat(80) + '\n';
+    email += '~'.repeat(80) + '\\nREPORT GENERATION FAILURE\\n' + '~'.repeat(80) + '\\n';
+
+    report += 'The Apex Test Execution report could not be generated due to an error.\nPlease review the corresponding function log for details.';
+    email += 'The Apex Test Execution report could not be generated due to an error.\\nPlease review the corresponding function log for details.';
+}
+
+// UPLOAD & EMAIL
+log2CopadoStatus('REPORT: Uploading and emailing report...');
+
+// Upload report
+customExecSync(`echo ""${report}"" > ${apexTestExecReport}
+    copado -u ${apexTestExecReport}`);
+
+// Send email
+if(emailTo.length > 0) {
+    console.log(`EMAIL: sending email to: ${emailTo}`);
+    sendSFEmail(sfSessionId, sfHost, emailTo, emailSubject, email);
+}
+
+log2CopadoStatus('<<< FUNCTION: END >>>');
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+// UTILITIES
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+
+function log2CopadoStatus(msg) {
+    execSync(`copado -p '${msg}'`);
+}
+
+function customExecSync(command, ignoreOutput = false) {
+    let result = '';
+    try {
+        if(!ignoreOutput) {
+            result = execSync(command);
+        } else {
+            execSync(command, {stdio: 'ignore'});
+            result = true;
+        }
+    }
+    catch(err) {
+        console.log('command failed [' + command + '] -- details: ' + err);
+        result = err.stdout;
+    }
+    return result;
+}
+
+// SF INIT
+function initSFCLI(sfSID, sfHName) {
+    let result = false;
+    try {
+        if(sfSID.length > 0) {
+            let cmdResult = customExecSync(`sf config set -g org-instance-url=${sfHName} --json`);
+            let jsonData = JSON.parse(cmdResult);
+
+            if(jsonData.status == 0 && jsonData.result.successes[0].success === true) {
+                result = true;
+            }
+        }
+    }
+    catch(err) {
+        console.log(err);
+    }
+    return result;
+}
+
+// SF CLI QUERY
+function sfCLIQuery(soql, sfSID) {
+    let result = {};
+    try {
+        if(sfSID.length > 0) {
+            let cmdResult = customExecSync(`sf data query --query ""${soql}"" --target-org ${sfSID} --json`);
+            let jsonData = JSON.parse(cmdResult);
+
+            if(jsonData.status == 0 && jsonData.result.done == true) {
+                result = jsonData;
+            }
+        }
+    }
+    catch(err) {
+        console.log(err);
+    }
+    return result;
+}
+
+// SEND EMAIL
+function sendSFEmail(sfSID, sfHost, to, subject, body) {
+    let path = `/services/data/${apiVersion}/actions/standard/emailSimple`;
+    let cmd = `curl -X POST -H ""Authorization: Bearer ${sfSID}"" -H ""Content-Type: application/json"" -s -d 'XXXX' ${sfHost}${path}`;
+
+    try {
+        if(sfSID.length > 0 && sfHost.length > 0 && to.length > 0 && subject.length > 0 && body.length > 0) {
+            let payload = `{""inputs"" : [{""emailBody"" : ""${body}"", ""emailAddresses"" : ""${to}"", ""emailSubject"" : ""${subject}"",
+                ""senderType"" : ""CurrentUser""}]}`;
+            cmd = cmd.replace('XXXX', payload);
+
+            let jsonData = customExecSync(cmd);
+            console.log('jsonData: ' + jsonData);
+
+            if(jsonData.isSuccess == true) {
+                return true;
+            }
+        }
+    }
+    catch(err) {
+        console.log(err);
+    }
+    return false;
+}
+
+// GET CREDENTIAL ID
+function getIdForName(objName, sfSID) {
+    let result = '0';
+    let soql = `SELECT Id FROM copado__Org__c WHERE Name = '${objName}'`;
+
+    try {
+        if(sfSID.length > 0) {
+            let jsonData = sfCLIQuery(soql, sfSID);
+            if(jsonData.status == 0 && jsonData.result.done == true) {
+                result = jsonData.result.records[0].Id;
+            }
+        }
+    }
+    catch(err) {
+        console.log(err);
+    }
+    return result;
+}
+
+// ATTACHMENT HELPERS
+function getAttachmentId(pId, aName, sfSID) {
+    let result = '';
+    let soql = `SELECT Id FROM Attachment WHERE ParentId = '${pId}' AND Name = '${aName}' LIMIT 1`;
+
+    try {
+        if(sfSID.length > 0) {
+            let jsonData = sfCLIQuery(soql, sfSID);
+            if(jsonData.status == 0 && jsonData.result.totalSize == 1) {
+                result = jsonData.result.records[0].Id;
+            }
+        }
+    }
+    catch(err) {
+        console.log(err);
+    }
+    return result;
+}
+
+function getAttachmentByNameForParentId(pId, aName, sfSID, sfHost, dType = 'string', dlFileName = '') {
+    let result = (dType == 'string') ? '' : '{}';
+    let path = `/services/data/${apiVersion}/sobjects/Attachment/XXXX/Body`;
+    let cmd = `curl -H ""Authorization: Bearer ${sfSID}"" -s XXXX ${sfHost}YYYY`;
+
+    try {
+        if(sfSID.length > 0) {
+            let aId = getAttachmentId(pId, aName, sfSID);
+            if(aId.length == 15 || aId.length == 18) {
+                cmd = cmd.replace('YYYY', path.replace('XXXX', aId));
+                cmd = (dlFileName.length > 0)
+                    ? cmd.replace('XXXX', `-o ${dlFileName}`)
+                    : cmd.replace('XXXX ', '');
+
+                result = customExecSync(cmd);
+            }
+        }
+    }
+    catch(err) {
+        console.log(err);
+    }
+    return result;
+}","This function is used to get the report of codeCoverage of all the apex classes","Execute Apex Test","","[ {
+  ""name"" : ""credentialName"",
+  ""defaultValue"" : ""Production-SFP""
+}, {
+  ""name"" : ""minCodeCoverage"",
+  ""defaultValue"" : ""85""
+}, {
+  ""name"" : ""sendEmailTo"",
+  ""defaultValue"" : ""gtanisha96@gmail.com""
+} ]"

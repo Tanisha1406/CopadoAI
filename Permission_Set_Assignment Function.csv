@@ -1,0 +1,136 @@
+"_","copado__API_Name__c","copado__Type__c","copado__Image_Name__c","copado__Script__c","copado__Description__c","Name","copado__Timeout__c","copado__Parameters__c"
+"[copado__Function__c]","Permission_Set_Assignment","Custom","copado-multicloud-metadata","#!/usr/bin/env node
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+// Script: permissionSetAssign.js
+// Modified: 20251205
+//
+// Notes: 1. Assigns a Permission Set to a list of users in a specified Salesforce org
+//        2. Sends an email report via Salesforce REST API summarizing the assignment results
+//        3. Pre-Req: SF Session Id, SF Host, Permission Set Id, and User Ids should be provided
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+
+const execSync = require('child_process').execSync;
+
+// -------------------- FUNCTION PARAMETERS -------------------- //
+const sfHost = process.env.CF_SF_ENDPOINT;
+const sfSessionId = process.env.CF_SF_SESSIONID;
+const permissionSetId = process.env.permissionSetId || '';
+const userIds = (process.env.userIds || '').split(',').map(u => u.trim());
+const emailTo = (process.env.sendEmailTo || '').trim();
+
+log2CopadoStatus('<<< FUNCTION: START >>>');
+
+// -------------------- VARIABLES -------------------- //
+let assignedUsers = [];
+let failedUsers = [];
+const isoDateString = new Date().toISOString();
+const emailSubject = `COPADO: Permission Set Assignment Report | ${isoDateString}`;
+
+// -------------------- ASSIGN PERMISSION SET -------------------- //
+log2CopadoStatus('ASSIGN: Permission Set to users...');
+userIds.forEach(userId => {
+    try {
+        const cmd = `sf data create copado__PermissionSetAssignment__c --values ""AssigneeId='${userId}' PermissionSetId='${permissionSetId}'"" --target-org ${sfSessionId} --json`;
+        const result = customExecSync(cmd);
+        const jsonData = JSON.parse(result);
+        if(jsonData.status === 0 && jsonData.result.successes && jsonData.result.successes.length > 0) {
+            assignedUsers.push(userId);
+        } else {
+            failedUsers.push(userId);
+        }
+    } catch(err) {
+        console.log(`ERROR: Failed to assign Permission Set to user ${userId} -- ${err}`);
+        failedUsers.push(userId);
+    }
+});
+
+// -------------------- FORMAT REPORT -------------------- //
+log2CopadoStatus('REPORT: Formatting...');
+let reportBody = `
+COPADO: Permission Set Assignment Report (${isoDateString})
+Permission Set Id: ${permissionSetId}
+
+Total Users Attempted: ${userIds.length}
+Successfully Assigned: ${assignedUsers.length}
+Failed Assignments: ${failedUsers.length}
+`;
+
+if(failedUsers.length > 0) {
+    reportBody += `Failed User IDs:\n${failedUsers.join('\n')}\n`;
+}
+
+const emailBody = reportBody.replace(/\n/g, '\\n'); // Format for SF email
+
+// -------------------- SEND EMAIL -------------------- //
+if(emailTo.length > 0) {
+    console.log(`EMAIL: sending report to: ${emailTo}`);
+    sendSFEmail(sfSessionId, sfHost, emailTo, emailSubject, emailBody);
+}
+
+log2CopadoStatus('<<< FUNCTION: END >>>');
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+// UTILITIES
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+
+function log2CopadoStatus(msg) {
+    try { execSync(`copado -p '${msg}'`); } catch(e){ console.log(msg); }
+}
+
+function customExecSync(command, ignoreOutput = false) {
+    let result = '';
+    try {
+        if(!ignoreOutput) {
+            result = execSync(command, { encoding: 'utf8' });
+        } else {
+            execSync(command, { stdio: 'ignore' });
+            result = true;
+        }
+    } catch(err) {
+        console.log('Command failed [' + command + '] -- details: ' + err);
+        result = err.stdout;
+    }
+    return result;
+}
+
+// -------------------- SEND EMAIL USING SF REST API -------------------- //
+function sendSFEmail(sfSID, sfHost, to, subject, body) {
+    const path = `/services/data/v64.0/actions/standard/emailSimple`;
+    const payload = JSON.stringify({
+        inputs: [
+            {
+                emailBody: body,
+                emailAddresses: to,
+                emailSubject: subject,
+                senderType: ""CurrentUser""
+            }
+        ]
+    });
+
+    const cmd = `curl -X POST -H ""Authorization: Bearer ${sfSID}"" -H ""Content-Type: application/json"" -s -d '${payload}' ${sfHost}${path}`;
+
+    try {
+        const jsonData = JSON.parse(execSync(cmd, { encoding: 'utf8' }));
+        if(jsonData[0] && jsonData[0].success === true) {
+            console.log(`EMAIL: Successfully sent to ${to}`);
+            return true;
+        } else {
+            console.log(`EMAIL: Failed to send. Response: ${JSON.stringify(jsonData)}`);
+        }
+    } catch(err) {
+        console.log('EMAIL: Exception occurred: ', err);
+    }
+    return false;
+}","This function is used to assign the permission set to users","Permission Set Assignment","10","[ {
+  ""name"" : ""PERMISSION_SET_NAME"",
+  ""defaultValue"" : """"
+}, {
+  ""name"" : ""FEDERATION_IDS"",
+  ""defaultValue"" : """"
+}, {
+  ""name"" : ""SessionID"",
+  ""defaultValue"" : ""{$Context.Credential.SessionId}""
+}, {
+  ""name"" : ""Endpoint"",
+  ""defaultValue"" : ""{$Context.Credential.Endpoint}""
+} ]"
